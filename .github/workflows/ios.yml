@@ -1,0 +1,85 @@
+# .github/workflows/ios-unsigned.yml
+name: iOS unsigned IPA (Feather-ready)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    env:
+      SCHEME: SOCKS
+      PROJECT: SOCKS.xcodeproj
+      IPA_NAME: SOCKS.ipa
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Xcode version
+        run: xcodebuild -version
+
+      - name: Archive (device, no signing)
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project "$PROJECT" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -destination "generic/platform=iOS" \
+            -archivePath build/App.xcarchive \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_IDENTITY= \
+            VALIDATE_PRODUCT=NO \
+            archive
+
+      - name: Create Payload
+        run: |
+          set -euo pipefail
+          APP_ROOT="build/App.xcarchive/Products/Applications"
+          APP_NAME="$(ls "$APP_ROOT" | head -n1)"
+          mkdir -p Payload
+          cp -R "$APP_ROOT/$APP_NAME" "Payload/$APP_NAME"
+          echo "APP_PATH=Payload/$APP_NAME" >> $GITHUB_ENV
+
+      - name: Ensure Info.plist keys
+        run: |
+          set -euo pipefail
+          PLIST="$APP_PATH/Info.plist"
+          # CFBundleExecutable (fallback: detect Mach-O in app root)
+          if ! /usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$PLIST" >/dev/null 2>&1; then
+            EXEC_NAME="$(find "$APP_PATH" -maxdepth 1 -type f -perm -111 \
+              -exec file {} \; | grep -i 'Mach-O' | head -n1 | awk -F: '{print $1}' | xargs -I{} basename {})"
+            [ -n "$EXEC_NAME" ] || { echo "No executable found"; exit 1; }
+            /usr/libexec/PlistBuddy -c "Add :CFBundleExecutable string $EXEC_NAME" "$PLIST" 2>/dev/null || \
+            /usr/libexec/PlistBuddy -c "Set :CFBundleExecutable $EXEC_NAME" "$PLIST"
+          fi
+          # Versions (Feather expects them to exist)
+          /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string ${GITHUB_RUN_NUMBER:-1}" "$PLIST" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Add :CFBundleShortVersionString string 1.0" "$PLIST" 2>/dev/null || true
+          # Must have a bundle id
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$PLIST" >/dev/null
+
+      - name: Confirm device binary (arm64)
+        run: |
+          set -euo pipefail
+          BIN="$APP_PATH/$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP_PATH/Info.plist")"
+          file "$BIN" | grep -qi 'arm64'
+
+      - name: Strip any signatures/profiles
+        run: |
+          set -euo pipefail
+          find "$APP_PATH" -type d -name "_CodeSignature" -exec rm -rf {} + || true
+          find "$APP_PATH" -type f -name "embedded.mobileprovision" -delete || true
+
+      - name: Zip IPA (unsigned)
+        run: |
+          set -euo pipefail
+          /usr/bin/zip -qry "$IPA_NAME" Payload
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: SOCKS.ipa
+          path: ${{ env.IPA_NAME }}
+          overwrite: true
+          retention-days: 7
